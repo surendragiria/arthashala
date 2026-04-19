@@ -9,7 +9,8 @@ import {
   Landmark, Home, Trash2, CheckCheck, Hourglass, ThumbsUp,
   PauseCircle, ChevronDown, File as FileIcon, MoreVertical,
   Handshake, Network, ClipboardCheck, ArrowRight, Inbox,
-  TrendingDown, Percent, Wallet, Settings, CircleDot, Sparkles
+  TrendingDown, Percent, Wallet, Settings, CircleDot, Sparkles,
+  ShieldCheck, AlertTriangle, Gauge, ScrollText, Scale, Flag
 } from 'lucide-react';
 
 // ============================================================
@@ -143,6 +144,25 @@ const SEED_LEADS = [
       { text: 'Strong financials. Promoter has 20+ years experience. Clean CIBIL (756).', by: 'Back Office', at: '2026-04-16T12:00:00' },
       { text: 'All documents received. Sharing with three lenders today.', by: 'Back Office', at: '2026-04-17T15:30:00' },
     ],
+    creditReview: {
+      cibilScore: 756,
+      bankingConduct: 'Excellent',
+      promoterBackground: 'Founder-promoter has 22 years in polymer manufacturing. Previously ran a smaller plastics unit in Rajkot (divested cleanly in 2012). No related-party concerns. Two references from existing lenders confirmed strong repayment track record.',
+      notes: 'Site visit on 16 Apr — plant well-maintained, capacity utilisation at ~78%. Bank statements show consistent inflows, no bounces in last 18 months. GST filings regular. Promoter confident on new injection moulding line payback within 4 years.',
+      lastUpdatedBy: 'Aarav Nair',
+      lastUpdatedAt: '2026-04-17T14:00:00',
+      history: [
+        {
+          id: 'h1',
+          at: '2026-04-17T14:00:00',
+          by: 'Aarav Nair',
+          score: 82,
+          recommendation: 'PROCEED',
+          reason: 'Strong financials (45% turnover growth, 10% PAT margin), clean CIBIL at 756, healthy DSCR at 2.1x. Promoter track record vetted. Approved to share with HDFC, Axis, and Bajaj Finserv given secured term loan nature.',
+          cibilScore: 756,
+        }
+      ]
+    },
   },
   {
     id: 'L-00411', createdAt: '2026-04-15T09:15:00', updatedAt: '2026-04-18T11:00:00',
@@ -865,10 +885,510 @@ const LeadsList = ({ leads, associates, openLead, onNewLead, role, currentAssoci
 };
 
 // ============================================================
-// LEAD DETAIL — with tabs (Overview, Financials, Documents, Lenders, Activity)
+// CREDIT REVIEW — scoring, risk flags, reviewer notes, recommendation
 // ============================================================
 
-const LeadDetail = ({ lead, associates, leads, setLeads, onBack, role }) => {
+// Heuristic scoring: pure functions, no state
+function computeCreditScore(lead) {
+  const weights = {
+    turnoverGrowth: 15,
+    patMargin: 15,
+    vintage: 10,
+    dscr: 20,
+    leverage: 15,
+    loanToTurnover: 15,
+    cibil: 10,
+  };
+
+  const scores = {};
+  const reasons = [];
+
+  // Turnover growth
+  const growth = lead.turnoverPrev > 0 ? (lead.turnover / lead.turnoverPrev - 1) : 0;
+  if (growth >= 0.25) scores.turnoverGrowth = 100;
+  else if (growth >= 0.10) scores.turnoverGrowth = 80;
+  else if (growth >= 0) scores.turnoverGrowth = 55;
+  else scores.turnoverGrowth = 25;
+  reasons.push({ key: 'turnoverGrowth', label: 'YoY Turnover Growth', value: `${(growth * 100).toFixed(1)}%`, score: scores.turnoverGrowth });
+
+  // PAT margin
+  const patMargin = lead.turnover > 0 ? lead.netProfit / lead.turnover : 0;
+  if (patMargin >= 0.12) scores.patMargin = 100;
+  else if (patMargin >= 0.07) scores.patMargin = 80;
+  else if (patMargin >= 0.03) scores.patMargin = 55;
+  else scores.patMargin = 25;
+  reasons.push({ key: 'patMargin', label: 'PAT Margin', value: `${(patMargin * 100).toFixed(1)}%`, score: scores.patMargin });
+
+  // Vintage
+  const v = lead.vintage || 0;
+  if (v >= 10) scores.vintage = 100;
+  else if (v >= 5) scores.vintage = 80;
+  else if (v >= 3) scores.vintage = 60;
+  else scores.vintage = 35;
+  reasons.push({ key: 'vintage', label: 'Business Vintage', value: `${v} years`, score: scores.vintage });
+
+  // DSCR proxy: annual net profit vs annual EMI burden (existing + proposed)
+  const existingAnnualEmi = (lead.monthlyEmi || 0) * 12;
+  const proposedEmi = estimateEMI(lead.loanAmount, lead.tenure, 0.12) * 12;
+  const totalAnnualObligation = existingAnnualEmi + proposedEmi;
+  const dscr = totalAnnualObligation > 0 ? (lead.netProfit + existingAnnualEmi * 0.7) / totalAnnualObligation : 3;
+  if (dscr >= 2.0) scores.dscr = 100;
+  else if (dscr >= 1.5) scores.dscr = 80;
+  else if (dscr >= 1.2) scores.dscr = 55;
+  else if (dscr >= 1.0) scores.dscr = 30;
+  else scores.dscr = 10;
+  reasons.push({ key: 'dscr', label: 'Debt Service Cover', value: `${dscr.toFixed(2)}x`, score: scores.dscr });
+
+  // Leverage: existing + proposed debt vs turnover
+  const totalDebt = (lead.existingAmount || 0) + Number(lead.loanAmount || 0);
+  const leverageRatio = lead.turnover > 0 ? totalDebt / lead.turnover : 2;
+  if (leverageRatio <= 0.25) scores.leverage = 100;
+  else if (leverageRatio <= 0.50) scores.leverage = 80;
+  else if (leverageRatio <= 0.85) scores.leverage = 55;
+  else if (leverageRatio <= 1.25) scores.leverage = 30;
+  else scores.leverage = 10;
+  reasons.push({ key: 'leverage', label: 'Debt / Turnover', value: `${(leverageRatio * 100).toFixed(0)}%`, score: scores.leverage });
+
+  // Loan to turnover — reasonableness of ask
+  const loanToTurnover = lead.turnover > 0 ? Number(lead.loanAmount) / lead.turnover : 1;
+  if (loanToTurnover <= 0.30) scores.loanToTurnover = 100;
+  else if (loanToTurnover <= 0.60) scores.loanToTurnover = 75;
+  else if (loanToTurnover <= 1.0) scores.loanToTurnover = 45;
+  else scores.loanToTurnover = 20;
+  reasons.push({ key: 'loanToTurnover', label: 'Loan / Turnover', value: `${(loanToTurnover * 100).toFixed(0)}%`, score: scores.loanToTurnover });
+
+  // CIBIL (from manual review if entered)
+  const cibil = lead.creditReview?.cibilScore;
+  if (cibil) {
+    if (cibil >= 750) scores.cibil = 100;
+    else if (cibil >= 700) scores.cibil = 75;
+    else if (cibil >= 650) scores.cibil = 50;
+    else scores.cibil = 20;
+    reasons.push({ key: 'cibil', label: 'CIBIL Score', value: cibil, score: scores.cibil });
+  } else {
+    scores.cibil = null;
+    reasons.push({ key: 'cibil', label: 'CIBIL Score', value: 'Not captured', score: null });
+  }
+
+  // Weighted score (only over captured metrics)
+  let totalWeight = 0, totalScore = 0;
+  Object.entries(scores).forEach(([k, v]) => {
+    if (v !== null) {
+      totalWeight += weights[k];
+      totalScore += v * weights[k];
+    }
+  });
+  const final = totalWeight > 0 ? Math.round(totalScore / totalWeight) : 0;
+
+  return { final, reasons, dscr, leverageRatio, loanToTurnover };
+}
+
+// Flat EMI estimate: P * r * (1+r)^n / ((1+r)^n - 1), r = monthly rate
+function estimateEMI(principal, months, annualRate = 0.12) {
+  const P = Number(principal) || 0;
+  const n = Number(months) || 60;
+  const r = annualRate / 12;
+  if (P === 0 || n === 0) return 0;
+  const emi = P * r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1);
+  return emi;
+}
+
+function computeRiskFlags(lead, score) {
+  const flags = [];
+
+  const growth = lead.turnoverPrev > 0 ? (lead.turnover / lead.turnoverPrev - 1) : 0;
+  if (growth < 0) flags.push({ tone: 'rose', msg: 'Turnover has declined year-on-year' });
+  else if (growth >= 0.30) flags.push({ tone: 'emerald', msg: 'Strong revenue growth (>30%)' });
+
+  const patMargin = lead.turnover > 0 ? lead.netProfit / lead.turnover : 0;
+  if (patMargin < 0.03) flags.push({ tone: 'rose', msg: 'Thin PAT margin (<3%)' });
+  else if (patMargin >= 0.15) flags.push({ tone: 'emerald', msg: 'Healthy profitability (>15% PAT)' });
+
+  if (score.dscr < 1.25) flags.push({ tone: 'rose', msg: `Weak debt serviceability (DSCR ${score.dscr.toFixed(2)}x)` });
+  else if (score.dscr >= 2) flags.push({ tone: 'emerald', msg: `Strong debt cover (DSCR ${score.dscr.toFixed(2)}x)` });
+
+  if (score.leverageRatio > 1.0) flags.push({ tone: 'rose', msg: 'High total leverage relative to turnover' });
+
+  if (score.loanToTurnover > 0.75) flags.push({ tone: 'amber', msg: 'Large ask relative to turnover' });
+
+  if ((lead.vintage || 0) < 3) flags.push({ tone: 'amber', msg: 'Limited business vintage (<3 years)' });
+
+  const docsCount = (lead.documents || []).length;
+  if (docsCount < 7) flags.push({ tone: 'amber', msg: `Only ${docsCount} of 9 docs uploaded` });
+
+  const cibil = lead.creditReview?.cibilScore;
+  if (cibil && cibil < 700) flags.push({ tone: 'rose', msg: `Sub-700 CIBIL score (${cibil})` });
+  else if (cibil && cibil >= 750) flags.push({ tone: 'emerald', msg: `Strong CIBIL score (${cibil})` });
+
+  if (!lead.secured && Number(lead.loanAmount) > 5e7) flags.push({ tone: 'amber', msg: 'Large unsecured ticket (>₹5 Cr)' });
+
+  return flags;
+}
+
+function suggestLenders(lead, score) {
+  const suggestions = [];
+  const amt = Number(lead.loanAmount);
+  const secured = lead.secured;
+  const cibil = lead.creditReview?.cibilScore || 0;
+  const strong = score.final >= 70;
+
+  if (secured && amt <= 5e7 && strong) suggestions.push({ name: 'HDFC Bank', reason: 'Bank-grade profile, ticket within their sweet spot' });
+  if (secured && amt <= 3e7 && strong) suggestions.push({ name: 'ICICI Bank', reason: 'Fits secured SME book' });
+  if (secured && amt > 5e7) suggestions.push({ name: 'IDFC First Bank', reason: 'Handles larger secured tickets well' });
+  if (!secured && amt <= 3e7 && cibil >= 720) suggestions.push({ name: 'Bajaj Finserv', reason: 'Strong in unsecured business loans' });
+  if (!secured && amt <= 5e7) suggestions.push({ name: 'Lendingkart', reason: 'Fintech — fast turnaround for unsecured' });
+  if (score.final < 60) suggestions.push({ name: 'Aditya Birla Finance', reason: 'Accommodative NBFC for moderate-risk profiles' });
+  if (lead.industry === 'IT / Software' && !secured) suggestions.push({ name: 'Indifi', reason: 'IT services sector familiarity' });
+  if (amt >= 15e7) suggestions.push({ name: 'Axis Bank', reason: 'Better for larger tickets' });
+
+  // dedupe
+  const seen = new Set();
+  return suggestions.filter(s => { if (seen.has(s.name)) return false; seen.add(s.name); return true; });
+}
+
+const CreditReviewPanel = ({ lead, updateLead, currentUser }) => {
+  const [cibilScore, setCibilScore] = useState(lead.creditReview?.cibilScore || '');
+  const [bankingConduct, setBankingConduct] = useState(lead.creditReview?.bankingConduct || 'Satisfactory');
+  const [promoterBackground, setPromoterBackground] = useState(lead.creditReview?.promoterBackground || '');
+  const [reviewNotes, setReviewNotes] = useState(lead.creditReview?.notes || '');
+  const [recommendation, setRecommendation] = useState('');
+  const [recReason, setRecReason] = useState('');
+
+  const score = useMemo(() => computeCreditScore(lead), [lead]);
+  const flags = useMemo(() => computeRiskFlags(lead, score), [lead, score]);
+  const lenderSuggestions = useMemo(() => suggestLenders(lead, score), [lead, score]);
+
+  const reviewHistory = lead.creditReview?.history || [];
+
+  const saveReviewInputs = () => {
+    updateLead({
+      creditReview: {
+        ...(lead.creditReview || {}),
+        cibilScore: Number(cibilScore) || null,
+        bankingConduct,
+        promoterBackground,
+        notes: reviewNotes,
+        history: reviewHistory,
+        lastUpdatedBy: currentUser.name,
+        lastUpdatedAt: new Date().toISOString(),
+      }
+    });
+  };
+
+  const submitRecommendation = () => {
+    if (!recommendation) {
+      alert('Please select a recommendation.');
+      return;
+    }
+    if (!recReason.trim()) {
+      alert('Please add a reason for this recommendation.');
+      return;
+    }
+
+    const statusMap = {
+      PROCEED: 'SENT_TO_LENDERS',
+      MORE_INFO: 'DOCS_PENDING',
+      REJECT: 'REJECTED',
+      HOLD: 'ON_HOLD',
+    };
+
+    const newHistoryEntry = {
+      id: uid(),
+      at: new Date().toISOString(),
+      by: currentUser.name,
+      score: score.final,
+      recommendation,
+      reason: recReason.trim(),
+      cibilScore: Number(cibilScore) || null,
+    };
+
+    const newNote = {
+      text: `Credit review: ${REC_META[recommendation].label}. Score ${score.final}/100. ${recReason.trim()}`,
+      by: currentUser.name,
+      at: new Date().toISOString(),
+    };
+
+    updateLead({
+      status: statusMap[recommendation],
+      creditReview: {
+        ...(lead.creditReview || {}),
+        cibilScore: Number(cibilScore) || null,
+        bankingConduct,
+        promoterBackground,
+        notes: reviewNotes,
+        history: [...reviewHistory, newHistoryEntry],
+        lastUpdatedBy: currentUser.name,
+        lastUpdatedAt: new Date().toISOString(),
+      },
+      notes: [...(lead.notes || []), newNote],
+    });
+
+    setRecommendation('');
+    setRecReason('');
+    alert(`Review submitted. Status updated to "${STATUSES[statusMap[recommendation]].label}".`);
+  };
+
+  const scoreBand = score.final >= 75 ? { label: 'Strong', tone: 'emerald', color: '#10b981' }
+    : score.final >= 60 ? { label: 'Acceptable', tone: 'amber', color: '#f59e0b' }
+    : score.final >= 45 ? { label: 'Marginal', tone: 'amber', color: '#f97316' }
+    : { label: 'Weak', tone: 'rose', color: '#f43f5e' };
+
+  const proposedEmi = estimateEMI(lead.loanAmount, lead.tenure, 0.12);
+
+  return (
+    <div className="space-y-6">
+      {/* Scorecard */}
+      <div className="bg-white rounded-lg ring-1 ring-stone-200 p-6">
+        <div className="flex items-start justify-between gap-6 flex-wrap">
+          <div className="flex items-center gap-6">
+            <ScoreGauge value={score.final} color={scoreBand.color} />
+            <div>
+              <div className="text-[11px] uppercase tracking-[0.15em] text-stone-500">Credit Score</div>
+              <div className="font-serif text-4xl text-stone-900 tabular-nums mt-0.5">{score.final}<span className="text-stone-400 text-2xl">/100</span></div>
+              <div className="mt-2"><Badge tone={scoreBand.tone}>{scoreBand.label}</Badge></div>
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-6 text-sm">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-stone-500">Est. EMI @ 12%</div>
+              <div className="font-serif text-xl text-stone-900 tabular-nums mt-1">{formatINR(proposedEmi)}</div>
+              <div className="text-xs text-stone-500 mt-0.5">over {lead.tenure} months</div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-stone-500">DSCR</div>
+              <div className="font-serif text-xl text-stone-900 tabular-nums mt-1">{score.dscr.toFixed(2)}x</div>
+              <div className="text-xs text-stone-500 mt-0.5">debt service cover</div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-stone-500">Leverage</div>
+              <div className="font-serif text-xl text-stone-900 tabular-nums mt-1">{(score.leverageRatio * 100).toFixed(0)}%</div>
+              <div className="text-xs text-stone-500 mt-0.5">debt / turnover</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Score breakdown */}
+        <div className="mt-6 pt-5 border-t border-stone-100">
+          <div className="text-[11px] uppercase tracking-[0.15em] text-stone-500 mb-3">Score Drivers</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2.5">
+            {score.reasons.map(r => (
+              <div key={r.key} className="flex items-center gap-3">
+                <div className="text-xs text-stone-700 w-36 shrink-0">{r.label}</div>
+                <div className="flex-1 h-1.5 bg-stone-100 rounded-full overflow-hidden">
+                  {r.score !== null && (
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${r.score}%`,
+                        backgroundColor: r.score >= 75 ? '#10b981' : r.score >= 55 ? '#f59e0b' : '#f43f5e'
+                      }}
+                    />
+                  )}
+                </div>
+                <div className="text-xs tabular-nums text-stone-900 w-20 text-right">{r.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Risk flags + Lender suggestions */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-white rounded-lg ring-1 ring-stone-200 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Flag size={15} className="text-stone-700" />
+            <h3 className="font-serif text-lg text-stone-900">Risk Signals</h3>
+          </div>
+          {flags.length === 0 ? (
+            <div className="text-sm text-stone-500 py-4">No material flags detected.</div>
+          ) : (
+            <ul className="space-y-2">
+              {flags.map((f, i) => (
+                <li key={i} className={`flex items-start gap-2 text-sm px-3 py-2 rounded-md ring-1 ring-inset ${TONE_MAP[f.tone]}`}>
+                  {f.tone === 'rose' && <AlertTriangle size={14} className="shrink-0 mt-0.5" />}
+                  {f.tone === 'amber' && <AlertCircle size={14} className="shrink-0 mt-0.5" />}
+                  {f.tone === 'emerald' && <CheckCircle2 size={14} className="shrink-0 mt-0.5" />}
+                  <span>{f.msg}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="bg-white rounded-lg ring-1 ring-stone-200 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <ShieldCheck size={15} className="text-stone-700" />
+            <h3 className="font-serif text-lg text-stone-900">Suggested Lenders</h3>
+          </div>
+          {lenderSuggestions.length === 0 ? (
+            <div className="text-sm text-stone-500 py-4">No strong lender fit identified from the current profile.</div>
+          ) : (
+            <ul className="space-y-2">
+              {lenderSuggestions.slice(0, 5).map((s, i) => (
+                <li key={i} className="flex items-start gap-3 text-sm py-2 border-b border-stone-100 last:border-0">
+                  <div className="w-7 h-7 bg-stone-100 rounded-md grid place-items-center font-serif text-xs text-stone-700 shrink-0">
+                    {s.name.split(' ').map(w => w[0]).slice(0, 2).join('')}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-stone-900">{s.name}</div>
+                    <div className="text-xs text-stone-500">{s.reason}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      {/* Manual review inputs */}
+      <div className="bg-white rounded-lg ring-1 ring-stone-200 p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <ScrollText size={15} className="text-stone-700" />
+          <h3 className="font-serif text-lg text-stone-900">Reviewer Inputs</h3>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Input
+            label="CIBIL / Commercial Bureau Score"
+            type="number"
+            value={cibilScore}
+            onChange={(e) => setCibilScore(e.target.value)}
+            placeholder="e.g. 756"
+            hint="Enter the pulled bureau score (300–900)"
+          />
+          <Select
+            label="Banking Conduct"
+            value={bankingConduct}
+            onChange={(e) => setBankingConduct(e.target.value)}
+            options={['Excellent', 'Satisfactory', 'Mixed', 'Concerning']}
+          />
+        </div>
+        <Textarea
+          label="Promoter background"
+          className="mt-4"
+          value={promoterBackground}
+          onChange={(e) => setPromoterBackground(e.target.value)}
+          placeholder="Promoter's industry experience, any related ventures, references…"
+        />
+        <Textarea
+          label="Reviewer notes"
+          className="mt-4"
+          value={reviewNotes}
+          onChange={(e) => setReviewNotes(e.target.value)}
+          placeholder="Observations from site visit, interview, bank statement analysis, GST patterns, unit economics…"
+          rows={4}
+        />
+        <div className="flex justify-end mt-4">
+          <Button variant="secondary" size="sm" onClick={saveReviewInputs}>Save reviewer inputs</Button>
+        </div>
+      </div>
+
+      {/* Recommendation */}
+      <div className="bg-white rounded-lg ring-1 ring-stone-200 p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Scale size={15} className="text-stone-700" />
+          <h3 className="font-serif text-lg text-stone-900">Recommendation</h3>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          {Object.entries(REC_META).map(([k, m]) => (
+            <button
+              key={k}
+              onClick={() => setRecommendation(k)}
+              className={`p-3 rounded-md text-left transition-colors ring-1 ${
+                recommendation === k ? `${TONE_MAP[m.tone]} ring-2` : 'bg-white ring-stone-200 text-stone-700 hover:ring-stone-400'
+              }`}
+            >
+              <m.icon size={14} className={recommendation === k ? '' : 'text-stone-500'} />
+              <div className="text-sm font-medium mt-1.5">{m.label}</div>
+              <div className="text-[10px] mt-0.5 leading-snug opacity-80">{m.sub}</div>
+            </button>
+          ))}
+        </div>
+        <Textarea
+          label="Reasoning for this recommendation"
+          className="mt-4"
+          value={recReason}
+          onChange={(e) => setRecReason(e.target.value)}
+          placeholder="Brief justification — this gets logged in the audit trail"
+        />
+        <div className="flex items-center justify-between mt-4 pt-4 border-t border-stone-100">
+          <div className="text-xs text-stone-500">
+            Submitting this recommendation updates the lead status and logs an audit entry.
+          </div>
+          <Button variant="amber" onClick={submitRecommendation} disabled={!recommendation}>
+            Submit review <ArrowRight size={14} />
+          </Button>
+        </div>
+      </div>
+
+      {/* Review history */}
+      {reviewHistory.length > 0 && (
+        <div className="bg-white rounded-lg ring-1 ring-stone-200 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Activity size={15} className="text-stone-700" />
+            <h3 className="font-serif text-lg text-stone-900">Review History</h3>
+          </div>
+          <div className="space-y-3">
+            {[...reviewHistory].reverse().map((h) => {
+              const m = REC_META[h.recommendation];
+              return (
+                <div key={h.id} className="border-l-2 border-stone-200 pl-4 py-1">
+                  <div className="flex items-center gap-2 text-xs text-stone-500">
+                    <span className="font-medium text-stone-900">{h.by}</span>
+                    <span>·</span>
+                    <span>{daysAgo(h.at)}</span>
+                    <span>·</span>
+                    <Badge tone={m.tone}>{m.label}</Badge>
+                    <span className="ml-auto tabular-nums">Score {h.score}/100{h.cibilScore ? ` · CIBIL ${h.cibilScore}` : ''}</span>
+                  </div>
+                  <p className="text-sm text-stone-700 mt-1.5 leading-relaxed">{h.reason}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const REC_META = {
+  PROCEED: { label: 'Proceed to Lenders', sub: 'Share with lenders', tone: 'emerald', icon: ArrowUpRight },
+  MORE_INFO: { label: 'Request More Info', sub: 'Pend until clarified', tone: 'amber', icon: AlertCircle },
+  HOLD: { label: 'Put on Hold', sub: 'Pause this application', tone: 'stone', icon: PauseCircle },
+  REJECT: { label: 'Reject', sub: 'Decline the application', tone: 'rose', icon: XCircle },
+};
+
+const ScoreGauge = ({ value, color }) => {
+  const size = 96;
+  const stroke = 10;
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference - (value / 100) * circumference;
+  return (
+    <div className="relative" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle cx={size / 2} cy={size / 2} r={radius} stroke="#f5f5f4" strokeWidth={stroke} fill="none" />
+        <circle
+          cx={size / 2} cy={size / 2} r={radius}
+          stroke={color} strokeWidth={stroke} fill="none"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          style={{ transition: 'stroke-dashoffset 0.6s ease' }}
+        />
+      </svg>
+      <div className="absolute inset-0 grid place-items-center">
+        <Gauge size={20} style={{ color }} />
+      </div>
+    </div>
+  );
+};
+
+// ============================================================
+// LEAD DETAIL — with tabs (Overview, Financials, Documents, Credit, Lenders, Activity)
+// ============================================================
+
+const LeadDetail = ({ lead, associates, leads, setLeads, onBack, role, currentUser }) => {
   const [tab, setTab] = useState('overview');
   const [sendingModal, setSendingModal] = useState(false);
   const [noteText, setNoteText] = useState('');
@@ -921,6 +1441,7 @@ const LeadDetail = ({ lead, associates, leads, setLeads, onBack, role }) => {
     { k: 'overview', label: 'Overview', icon: Eye },
     { k: 'financials', label: 'Financials', icon: IndianRupee },
     { k: 'documents', label: 'Documents', icon: FileText },
+    ...(role === 'BACKOFFICE' ? [{ k: 'credit', label: 'Credit Review', icon: ClipboardCheck }] : []),
     { k: 'lenders', label: 'Lenders', icon: Landmark },
     { k: 'activity', label: 'Activity', icon: Activity },
   ];
@@ -1121,6 +1642,10 @@ const LeadDetail = ({ lead, associates, leads, setLeads, onBack, role }) => {
             })}
           </div>
         </div>
+      )}
+
+      {tab === 'credit' && role === 'BACKOFFICE' && (
+        <CreditReviewPanel lead={lead} updateLead={updateLead} currentUser={currentUser} />
       )}
 
       {tab === 'lenders' && (
@@ -2350,7 +2875,7 @@ export default function App() {
   }, []);
 
   const [users, setUsers, usersLoaded] = useStorage('users_v1', SEED_USERS);
-  const [leads, setLeads, leadsLoaded] = useStorage('leads_v2', SEED_LEADS);
+  const [leads, setLeads, leadsLoaded] = useStorage('leads_v3', SEED_LEADS);
   const [currentUserId, setCurrentUserId, sessionLoaded] = useStorage('session_v1', null);
 
   const [view, setView] = useState('dashboard');
@@ -2485,6 +3010,7 @@ export default function App() {
               setLeads={setLeads}
               onBack={closeLead}
               role={role}
+              currentUser={currentUser}
             />
           )}
         </main>
