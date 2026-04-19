@@ -324,35 +324,26 @@ function useStorage(key, seed) {
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await window.storage.get(key);
-        if (!cancelled) {
-          if (res && res.value) {
-            setData(JSON.parse(res.value));
-          } else {
-            await window.storage.set(key, JSON.stringify(seed));
-            setData(seed);
-          }
-          setLoaded(true);
-        }
-      } catch {
-        if (!cancelled) {
-          setData(seed);
-          setLoaded(true);
-        }
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw !== null) {
+        setData(JSON.parse(raw));
+      } else {
+        localStorage.setItem(key, JSON.stringify(seed));
+        setData(seed);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch {
+      setData(seed);
+    }
+    setLoaded(true);
     // eslint-disable-next-line
   }, []);
 
-  const save = async (next) => {
+  const save = (next) => {
     const value = typeof next === 'function' ? next(data) : next;
     setData(value);
     try {
-      await window.storage.set(key, JSON.stringify(value));
+      localStorage.setItem(key, JSON.stringify(value));
     } catch (e) {
       console.error('Save failed', e);
     }
